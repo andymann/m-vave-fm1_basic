@@ -1,0 +1,6 @@
+[submodule "firmware/base"]
+	path = firmware/base
+	url = https://github.com/charlesvestal/fm1-base
+[submodule "fm1_open"]
+	path = fm1_open
+	url = https://github.com/m-vave/fm1_open
