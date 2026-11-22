@@ -2,7 +2,7 @@
 name = "CLOCKBOX"              # APP_NAME is in app.h; this names the build's files
 id_prefix = "FM-1_130977"     # package identity: dev builds FM-1_13097700, releases FM-1_130977XXYYZZ
 usb_manufacturer = "socialmidi"
-usb_product = "CLOCKBOX FM-1"
+usb_product = "Clockbox v3 FM-1"
 o2 = []                        # separate units compiled at -O2 (an app's DSP)
 words = "words.tsv"
 ble = true                     # Bluetooth MIDI (--no-ble builds without it)

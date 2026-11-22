@@ -158,7 +158,7 @@ A port of **ClockBox v3** (github.com/Andymann/clockbox-v3, `clockbox-v3.ino` 3.
 - `fm1.toml`:
   - `name = "CLOCKBOX"`
   - `id_prefix = "FM-1_130977"` (set 2026-11-22 by the user): dev builds `FM-1_13097700`, releases `FM-1_130977XXYYZZ`. Units flashed earlier still report `FM-1_7700` until reflashed
-  - `usb_manufacturer = "socialmidi"`, `usb_product = "CLOCKBOX FM-1"`
+  - `usb_manufacturer = "socialmidi"`, `usb_product = "Clockbox v3 FM-1"` (CoreMIDI on the Mac may keep showing an earlier name, e.g. "DUB-1 FM-1", until the device is removed in Audio MIDI Setup)
   - `ble = true`, `ble_central = false`, `ble_stack = "own"`; companion removed
 - `words.tsv`
 - `tests/basic.txt` (86 checks), `tests/screens.txt`
