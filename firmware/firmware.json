@@ -1,14 +1,14 @@
 {
   "schema": 1,
-  "id": "myfm1",
-  "name": "myfm1",
+  "id": "clockbox",
+  "name": "socialmidi",
   "license": "MPL-2.0",
-  "tagline": "my own FM-1 firmware",
-  "description": "The smallest complete firmware for the FM-1, made to be copied. The keys play a simple voice with velocity and pressure, your settings save, MIDI goes in and out over USB and Bluetooth and comes in over TRS, and it works with a screen reader.",
-  "tags": ["synth", "utility"],
+  "tagline": "ClockBox v3 MIDI master clock on the FM-1",
+  "description": "ClockBox v3 (github.com/Andymann/clockbox-v3) on the FM-1: a 24 PPQN MIDI master clock over USB and Bluetooth MIDI with Quantized Restart, follow modes for clock from the TRS jack or USB, tap tempo, three tempo presets that jump or fade, and a sync pulse on the audio out.",
+  "tags": ["utility"],
   "hardware": {
     "models": ["FM-1"],
     "flash": ["856014", "B36014"],
-    "features": ["bluetooth-midi", "bluetooth-midi-devices", "usb-audio-in", "usb-audio-out", "velocity", "pressure", "screen-reader", "companion"]
+    "features": ["bluetooth-midi", "usb-audio-in", "usb-audio-out", "screen-reader"]
   }
 }

@@ -1,22 +1,22 @@
-# The template's build settings (tools/build.py)
-name = "MYFM1"                 # APP_NAME is in app.h; this names the build's files
-id_prefix = "FM-1_77"          # CHANGE: a prefix nobody else uses (check thefirmwarehub.com); dev FM-1_7700, releases FM-1_77XXYYZZ
-usb_manufacturer = "myfm1"
-usb_product = "MYFM1 FM-1"
+# CLOCKBOX build settings (tools/build.py)
+name = "CLOCKBOX"              # APP_NAME is in app.h; this names the build's files
+id_prefix = "FM-1_130977"     # package identity: dev builds FM-1_13097700, releases FM-1_130977XXYYZZ
+usb_manufacturer = "socialmidi"
+usb_product = "CLOCKBOX FM-1"
 o2 = []                        # separate units compiled at -O2 (an app's DSP)
 words = "words.tsv"
 ble = true                     # Bluetooth MIDI (--no-ble builds without it)
-ble_central = true             # and the FM-1 connects to Bluetooth MIDI devices too
-companion = true               # the companion services: the saved settings as a file for a page (app.h APP_FILE_OBJS)
+ble_central = false            # (the ClockBox only sends: no Bluetooth MIDI devices to connect to)
+ble_stack = "own"              # fm1-base's own BLE stack (MPL-2.0): no JieLi SDK libraries needed
 # the site (tools/make_site.py, tools/publish_site.sh)
-tagline = "my own FM-1 firmware"
+tagline = "ClockBox v3 MIDI master clock on the FM-1"
 repo = ""                      # your repository URL
 licence = "MPL-2.0"
 credits = ""                   # a sentence for the installer's footer: what your firmware is built from
 # firmware.json, for firmware hubs (docs/FIRMWARE-JSON.md): the build writes it from these and the keys above
 author = ""                     # your name
-description = "The smallest complete firmware for the FM-1, made to be copied. The keys play a simple voice with velocity and pressure, your settings save, MIDI goes in and out over USB and Bluetooth and comes in over TRS, and it works with a screen reader."
-tags = ["synth", "utility"]    # from the list in docs/FIRMWARE-JSON.md; the build refuses another
+description = "ClockBox v3 (github.com/Andymann/clockbox-v3) on the FM-1: a 24 PPQN MIDI master clock over USB and Bluetooth MIDI with Quantized Restart, follow modes for clock from the TRS jack or USB, tap tempo, three tempo presets that jump or fade, and a sync pulse on the audio out."
+tags = ["utility"]             # from the list in docs/FIRMWARE-JSON.md; the build refuses another
 install = ""
 site = ""
 screenshot = ""                 # a square PNG (≥240x240) in your repository, for firmware hubs

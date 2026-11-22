@@ -1,122 +1,535 @@
-/* SPDX-License-Identifier: MPL-2.0
- * Copyright (C) 2026 Charles Vestal */
-/* The template app: every control on the screen as it arrives, by the name the app knows it by (plat.h B_*, EN_*,
- * the keys), and a few of them doing something: the keys play a voice and go out over USB-MIDI (MIDI in plays it
- * too), OCT- / OCT+ set the octave, PRESET the wave, MASTER the volume, SAVE stores the settings; the keys are
- * played with velocity and pressure (lib/touch.h), shown on them. One of each thing the platform offers, kept short. Part of the unity build (device/unity.c, host/plat_host.c), after the platform:
- * gfx.c and announce.c are in scope. */
+/* SPDX-License-Identifier: MPL-2.0 */
+/* CLOCKBOX: ClockBox v3 (https://github.com/Andymann/clockbox-v3, clockbox-v3.ino 3.55) on the M-VAVE FM-1.
+ *
+ * A MIDI master clock at 24 PPQN with Quantized Restart (QRS), two standalone modes (QRS Stop Start, QRS Start) and
+ * two follow modes (clock in from the TRS jack, or from USB, passed through), tap tempo, three tempo presets (a
+ * press jumps, a hold fades), a clock divider for the sync output, LED brightness, and an update mode.
+ *
+ * What the FM-1 has instead of the ClockBox's hardware:
+ *   6 TRS MIDI outs + USB       USB MIDI + Bluetooth MIDI (the FM-1 has no MIDI out jack)
+ *   TRS MIDI in                 the TRS MIDI in jack ("DIN" in the ClockBox's words)
+ *   CV clock / CV start jacks   the audio out, when SYNC OUT is on: the left channel pulses with the clock (the
+ *                               divider's rate), the right channel gives the playhead-reset pulse after a stop
+ *   TAP, PLAY, STOP             SEQ, PLAY, REC
+ *   PRESET 1 / 2 / 3            FX, SEL, ENV (a press jumps, a hold of 1 s fades, HOME + a press stores)
+ *   encoder, its click          SELECT (ALGO: steps of 5), HOME held
+ *   4 beat LEDs + clock-in LED  the screen (in their colours), and the LEDs of keys F3 G3 A3 B3 and C4; PLAY's LED:
+ *                               green while playing, red while a restart waits
+ *   nudge (in the source, unused there)   OCT- / OCT+ held: the tempo -7.5 % / +7.5 % while held
+ *
+ * Timing: the engine runs in the platform's 1 kHz tick (app_tick, timer interrupt). It measures the time that has
+ * passed on the 24 MHz crystal (TIMER4) and sends every clock that has fallen due: jitter under 1 ms, and no drift.
+ * The host simulator steps it a millisecond at a time. The main loop only asks (the req_* flags); the tick owns the
+ * transport. One unity build with the platform (device/unity.c, host/plat_host.c): gfx.c and announce.c in scope. */
 #include "fastmath.h"
 
-#define SET_MAGIC 0x54504C31u            /* "TPL1": the settings record; another magic loads defaults */
+#define VERSION "3.55"
+#define PPQN 24u
+#define BAR (PPQN * 4u)
+
+/* ------------------------------------------------------------- settings --- */
+enum { M_QRS_STOPSTART, M_QRS_START, M_FOLLOW_DIN, M_FOLLOW_USB, NMODES };   /* the ClockBox's order (arrModes) */
+static const char *const MODE_NAME[NMODES] = {"QRS STOP START", "QRS START", "FOLLOW DIN", "FOLLOW USB"};
+static const uint8_t DIVIDER[] = {1, 2, 4, 8, 16, 32, 64};
+#define NDIV ((uint32_t)sizeof DIVIDER)
+#define BPM_MIN 30
+#define BPM_MAX 300
+#define BRIGHT_MIN 10
+#define BRIGHT_MAX 200
+
+#define SET_MAGIC 0x584F4243u            /* "CBOX" */
 typedef struct {
     uint32_t magic;
-    int8_t octave;                       /* -2 .. +2 */
-    uint8_t wave;                        /* 0 sine, 1 triangle */
-    uint8_t ble_off;                     /* Bluetooth switched off (REC held); 0, the default: on */
-    uint8_t rsv[1];
+    uint16_t preset[3];                  /* BPM */
+    uint8_t mode;                        /* M_* */
+    uint8_t qrs_offset;                  /* 1..24: the Stop this many ticks before the one (QRS STOP START) */
+    uint8_t div;                         /* index into DIVIDER */
+    uint8_t bright;                      /* LED brightness 10..200 */
+    uint8_t sync_out;                    /* the audio sync pulses on */
+    uint8_t rsv;
 } settings_t;
 static settings_t set;
-static uint8_t set_dirty;                /* changed since the last save: SAVE is lit */
 
-static const char *const WAVE_NAME[] = {"SINE", "TRIANGLE"};
-/* the controls by their names in plat.h, in its order */
-static const char *const BTN_NAME[NB] = {"FX", "SEL", "ENV", "LFO", "EDIT", "GLO", "HOME", "SAVE", "ARP", "SEQ",
-                                         "PLAY", "REC", "OCT-", "OCT+"};
-static const char *const ENC_NAME[NE] = {"SELECT", "ALGO", "PRESET", "K1", "K2", "K3", "K4"};
+static int standalone(void) { return set.mode == M_QRS_STOPSTART || set.mode == M_QRS_START; }
 
-/* ------------------------------------------------------------------ voice --- */
-/* one voice, the last note wins; the main loop and MIDI in set it, the audio interrupt plays it */
-static volatile int32_t voice_note = -1;     /* MIDI note, -1 = released */
-static volatile float voice_vel = 1.0f;      /* the note's velocity, 0..1 */
-static float voice_phase, voice_level, gain_now;   /* gain_now glides to MASTER: no step at a block's edge */
-
-static void note_on(int32_t note, uint32_t vel)
-{
-    voice_vel = (float)vel / 127.0f;
-    voice_note = note;
-}
-static void note_off(int32_t note)
-{
-    if (voice_note == note)
-        voice_note = -1;
-}
-
-static volatile uint32_t midi_last, midi_last_port, midi_count;   /* the last message in (shown), and how many */
-static void midi_in(void)                    /* audio interrupt: the packets that came in */
-{
-    uint32_t pkt;
-    int port;
-    while (plat_midi_in(&pkt, &port)) {
-        uint32_t st = (pkt >> 8) & 0xFFu, d1 = (pkt >> 16) & 0x7Fu, d2 = pkt >> 24;
-        if (st != 0xF8u && st != 0xFEu) {    /* (clock and active sensing would flood the screen) */
-            midi_last = pkt;
-            midi_last_port = (uint32_t)port;
-            midi_count++;
-        }
-        if ((st & 0xF0u) == 0x90u && d2)
-            note_on((int32_t)d1, d2);
-        else if ((st & 0xF0u) == 0x80u || (st & 0xF0u) == 0x90u)
-            note_off((int32_t)d1);
-    }
-}
-
-void app_render(int32_t *lr, uint32_t n, uint32_t master_q12)
-{
-    uint32_t i;
-    int32_t note = voice_note;
-    float target = note >= 0 ? 0.25f * voice_vel : 0.0f;
-    float inc = note >= 0 ? 440.0f * fm_exp2f((float)(note - 69) / 12.0f) / 44100.0f : 0.0f;
-    float gain = (float)master_q12 / 4096.0f * 8300000.0f;   /* MASTER, read once a block */
-    midi_in();
-    for (i = 0; i < n; i++) {
-        float s;
-        voice_level += (target - voice_level) * 0.002f;          /* ~10 ms attack and release */
-        gain_now += (gain - gain_now) * 0.004f;                  /* ~5 ms: turning MASTER does not click */
-        voice_phase += inc;
-        if (voice_phase >= 1.0f)
-            voice_phase -= 1.0f;
-        s = set.wave ? 4.0f * fm_fabsf(voice_phase - 0.5f) - 1.0f : fm_sinf(voice_phase * 6.2831853f);
-        s *= voice_level * gain_now;
-        lr[2 * i] = (int32_t)s;
-        lr[2 * i + 1] = (int32_t)s;
-    }
-}
-
-void app_panic(void)
-{
-    voice_note = -1;
-    voice_level = 0.0f;
-}
-
-/* --------------------------------------------------------------- settings --- */
-static void settings_defaults(void)
+static void settings_defaults(void)      /* the ClockBox's EEPROM defaults (manual: Saved Settings) */
 {
     set.magic = SET_MAGIC;
-    set.octave = 0;
-    set.wave = 0;
-    set.ble_off = 0;
+    set.preset[0] = 80;
+    set.preset[1] = 100;
+    set.preset[2] = 120;
+    set.mode = M_QRS_STOPSTART;
+    set.qrs_offset = 1;
+    set.div = 0;
+    set.bright = 50;
+    set.sync_out = 0;
+    set.rsv = 0;
 }
 
-static void settings_load(void)          /* the saved settings, or the defaults when there are none or they are wrong */
+static void settings_load(void)
 {
-    if (plat_store_load(OBJ_SETTINGS, &set, sizeof set) != (int)sizeof set || set.magic != SET_MAGIC
-        || set.octave < -2 || set.octave > 2 || set.wave > 1u || set.ble_off > 1u)
+    uint32_t i;
+    if (plat_store_load(OBJ_SETTINGS, &set, sizeof set) != (int)sizeof set || set.magic != SET_MAGIC ||
+        set.mode >= NMODES || set.qrs_offset < 1 || set.qrs_offset > PPQN || set.div >= NDIV ||
+        set.bright < BRIGHT_MIN || set.bright > BRIGHT_MAX || set.sync_out > 1u) {
         settings_defaults();
+        return;
+    }
+    for (i = 0; i < 3u; i++)
+        if (set.preset[i] < BPM_MIN || set.preset[i] > BPM_MAX)
+            set.preset[i] = (uint16_t)(80 + 20 * i);
 }
 
-void app_init(void) { settings_load(); }
+/* ----------------------------------------------------- the clock engine --- */
+/* main loop -> tick */
+static volatile uint32_t period_ns = 2500000000u / 94u;   /* one 24 PPQN tick; the ClockBox starts at 94 BPM */
+static volatile uint8_t req_start, req_stop, req_mode;    /* PLAY, STOP, a new mode */
+static volatile uint8_t engine_on;                        /* after the boot screen (the ClockBox: after showInfo) */
+static volatile uint8_t update_mode;                      /* STOP held at power-on: no MIDI out */
+/* tick -> main loop, the screen */
+static volatile uint8_t playing, qrs_wait;
+static volatile uint32_t ck_tick;                         /* the generator's tick, from the start (uClock's) */
+static volatile uint32_t beat_count;                      /* +1 at each divider tick (the preset fade steps on it) */
+enum { L_OFF, L_GREEN, L_BLUE, L_PURPLE };
+static volatile uint8_t led[4], ext_led, blink, blink_col;
+static volatile uint32_t ext_ticks, ext_period_us;       /* follow modes: the clocks in, and their spacing */
+static volatile uint32_t starts_out, stops_out;           /* (counts for the host's checks) */
+static volatile uint32_t last_start_ms, last_stop_ms;
+
+/* the sync pulses for the render: an event ring, the tick writes, the audio interrupt reads */
+typedef struct {
+    uint32_t ms;
+    uint16_t width;                      /* samples */
+    uint8_t ch;                          /* 0 the clock (left), 1 the playhead reset (right) */
+} pulse_t;
+#define NPULSE 16u
+static pulse_t pulse_q[NPULSE];
+static volatile uint32_t pulse_w, pulse_r;
+static uint8_t reset_pending;            /* bWaitSyncStop: a reset pulse at the next divider tick */
+static uint32_t now_tick_ms;             /* the tick's millisecond */
+
+static void send_rt(uint8_t status, uint32_t to)
+{
+    if (!update_mode)
+        plat_midi_send(0x0Fu | (uint32_t)status << 8, to);
+}
+#define OUTS (TO_USB | TO_BLE)
+
+#ifdef PLAT_HOST
+/* the host's measurements: the clocks out since "expect mark 1", their rate and their worst spacing error */
+static uint32_t m_count, m_first, m_last, m_maxdev_us, m_on;
+static uint32_t last_start_tick, last_stop_tick;
+static void measure_clock(void)
+{
+    if (!m_on)
+        return;
+    if (m_count) {
+        int32_t dev = (int32_t)((now_tick_ms - m_last) * 1000u) - (int32_t)(period_ns / 1000u);
+        uint32_t a = (uint32_t)(dev < 0 ? -dev : dev);
+        if (a > m_maxdev_us)
+            m_maxdev_us = a;
+    } else {
+        m_first = now_tick_ms;
+    }
+    m_last = now_tick_ms;
+    m_count++;
+}
+#define MEASURE_CLOCK() measure_clock()
+#define MARK_START() (last_start_tick = ck_tick)
+#define MARK_STOP() (last_stop_tick = ck_tick)
+#else
+#define MEASURE_CLOCK() ((void)0)
+#define MARK_START() ((void)0)
+#define MARK_STOP() ((void)0)
+#endif
+
+static void send_start(void)             /* sendMidiStart: every out (follow USB: the ones that are not USB) */
+{
+    send_rt(0xFA, set.mode == M_FOLLOW_USB ? TO_BLE : OUTS);
+    starts_out++;
+    last_start_ms = now_tick_ms;
+    MARK_START();
+}
+static void send_stop(void)
+{
+    send_rt(0xFC, set.mode == M_FOLLOW_USB ? TO_BLE : OUTS);
+    stops_out++;
+    last_stop_ms = now_tick_ms;
+    MARK_STOP();
+}
+
+static void pulse(uint32_t ch)
+{
+    uint32_t w = period_ns / 22676u;     /* one tick, in samples at 44.1 kHz ... */
+    if (w > 661u)                        /* ... at most 15 ms (an AC-coupled output droops on longer ones) */
+        w = 661u;
+    if (w < 44u)
+        w = 44u;
+    if (pulse_w - pulse_r >= NPULSE)
+        return;
+    pulse_q[pulse_w % NPULSE].ms = now_tick_ms;
+    pulse_q[pulse_w % NPULSE].width = (uint16_t)w;
+    pulse_q[pulse_w % NPULSE].ch = (uint8_t)ch;
+    pulse_w++;
+}
+
+static void leds_off(void)
+{
+    led[0] = led[1] = led[2] = led[3] = L_OFF;
+}
+
+/* ledIndicateMeasure */
+static void led_measure(uint32_t m)
+{
+    if (!playing || m > 3u)
+        return;
+    if (qrs_wait) {
+        led[m] = L_PURPLE;               /* (the ClockBox sets the pixel without clearing: they add up) */
+    } else if (m == 0u) {
+        led[0] = led[1] = led[2] = led[3] = L_GREEN;
+    } else {
+        leds_off();
+        led[m] = L_BLUE;
+    }
+}
+
+/* handleCVGate: the sync output at the divider's rate, the playhead reset after a stop */
+static void cv_gate(uint32_t tick)
+{
+    uint32_t d = 6u * DIVIDER[set.div];
+    if (tick % d == 0u) {
+        if (playing)
+            pulse(0);
+        else if (reset_pending) {
+            pulse(1);
+            reset_pending = 0;
+        }
+        beat_count++;
+    }
+}
+
+/* handleLED: the beat lights and the screen's blinker */
+static uint32_t blink_timer = 1, measure;
+static void led_tick(uint32_t tick)
+{
+    if (tick == 1u || tick % BAR == 0u) {            /* the one */
+        blink_timer = 12;
+        measure = 0;
+        led_measure(measure);
+        blink = 1;
+        measure++;
+        if (!standalone() && qrs_wait) {             /* QRS while following: Start on the one counted in */
+            send_start();
+            qrs_wait = 0;
+        }
+    } else if (tick % PPQN == 0u) {                  /* each quarter */
+        blink_timer = 8;
+        led_measure(measure);
+        blink = 1;
+        measure++;
+    } else if (tick % blink_timer == 0u) {
+        if (!qrs_wait) {
+            leds_off();
+            blink = 0;
+        }
+    }
+}
+
+/* ClockOutPPQN + handleClockTick: one tick of the internal clock */
+static void clock_tick(uint32_t tick)
+{
+    send_rt(0xF8, OUTS);                             /* always, playing or not (SENDCLOCK_ALWAYS) */
+    MEASURE_CLOCK();
+    if (qrs_wait) {
+        if (tick % BAR == BAR - set.qrs_offset && set.mode == M_QRS_STOPSTART)
+            send_stop();                             /* Stop just before the one ... */
+        if (tick % BAR == 0u) {
+            send_start();                            /* ... Start on it */
+            qrs_wait = 0;
+        }
+    }
+    cv_gate(tick);
+    led_tick(tick);
+}
+
+/* checkMidiDIN / checkMidiUSB: the clock from outside, passed straight through, counted for the lights */
+static uint32_t ext_count, ext_last_ms;
+static void follow_in(uint8_t st)
+{
+    uint32_t to = set.mode == M_FOLLOW_DIN ? OUTS : TO_BLE;   /* USB's clock goes on to the outs that are not USB */
+    send_rt(st, to);
+    if (st == 0xFA) {
+        playing = 1;
+        ext_count = 0;
+        return;
+    }
+    if (st == 0xFC) {
+        playing = 0;
+        return;
+    }
+    /* 0xF8 */
+    if (ext_count % PPQN == 0u)
+        blink = 1, ext_led = 1;
+    if (ext_count % PPQN == 8u)
+        blink = 0, ext_led = 0;
+    ext_count = ext_count > BAR - 2u ? 0u : ext_count + 1u;
+    if (ext_last_ms) {                               /* the incoming tempo, for the screen (a smoothed spacing) */
+        uint32_t us = (now_tick_ms - ext_last_ms) * 1000u;
+        ext_period_us = ext_period_us ? (ext_period_us * 7u + us) / 8u : us;
+    }
+    ext_last_ms = now_tick_ms;
+    ext_ticks++;
+    cv_gate(ext_count);
+    led_tick(ext_count);
+}
+
+static uint32_t acc_ns;
+static uint8_t was_standalone;
+#ifndef PLAT_HOST
+static uint32_t t24_last;
+#endif
+void app_tick(void)
+{
+    uint32_t pkt, n, elapsed;
+    int port;
+#ifdef PLAT_HOST
+    elapsed = 1000000u;                              /* the simulator steps a millisecond at a time */
+#else
+    {                                                /* the time that has passed, on the crystal: a tick held up (a
+                                                      * flash write with interrupts off) loses nothing */
+        uint32_t t = plat_ticks24(), d = t - t24_last;
+        t24_last = t;
+        if (d > 2400000u)                            /* (the first call, or an absurd gap: one tick) */
+            d = 24000u;
+        elapsed = d / 24u * 1000u + d % 24u * 1000u / 24u;
+    }
+#endif
+    now_tick_ms = plat_ms();
+    /* MIDI in: read here only (one reader); the follow modes pass the clock through, the rest is not used */
+    while (plat_midi_in(&pkt, &port)) {
+        uint8_t st = (uint8_t)(pkt >> 8);
+        if (!engine_on || update_mode)
+            continue;
+        if ((set.mode == M_FOLLOW_DIN && port == PORT_TRS) || (set.mode == M_FOLLOW_USB && port == PORT_USB))
+            if (st == 0xF8 || st == 0xFA || st == 0xFC)
+                follow_in(st);
+    }
+    if (!engine_on || update_mode)
+        return;
+    if (req_mode) {                                  /* processModeSwitch */
+        req_mode = 0;
+        if (!standalone()) {
+            playing = 0;                             /* stopPlaying(true) */
+            qrs_wait = 0;
+            send_stop();
+            reset_pending = 1;
+            leds_off();
+            ext_count = 0;
+            ext_last_ms = 0;
+            ext_period_us = 0;
+        } else if (!was_standalone) {
+            acc_ns = 0;                              /* uClock.start(): the clock runs again from its tick 0 (not
+                                                      * between the two standalone modes: the bar stays where it is) */
+            ck_tick = 0;
+        }
+        was_standalone = (uint8_t)standalone();
+        blink = 0;
+        ext_led = 0;
+    }
+    if (req_start) {                                 /* startHandler -> startPlaying */
+        req_start = 0;
+        if (!standalone()) {
+            qrs_wait = 1;                            /* following: a Start on the next one counted in */
+        } else if (!playing) {
+            send_start();
+            playing = 1;
+            ck_tick = 0;                             /* uClock.start(): tick 0 now */
+            acc_ns = period_ns;
+        } else {
+            qrs_wait = 1;                            /* playing: Quantized Restart */
+        }
+    }
+    if (req_stop) {                                  /* stopHandler -> stopPlaying */
+        req_stop = 0;
+        if (standalone()) {
+            playing = 0;
+            qrs_wait = 0;
+            send_stop();
+            reset_pending = 1;                       /* syncPlayheadReset */
+            leds_off();
+        }
+    }
+    if (!standalone())
+        return;
+    acc_ns += elapsed;
+    for (n = 0; acc_ns >= period_ns && n < 32u; n++) {   /* every clock due (a burst after a held-up tick) */
+        acc_ns -= period_ns;
+        clock_tick(ck_tick);
+        ck_tick++;
+    }
+}
+
+/* the BPM the engine runs at (uClock.setTempo) */
+static float bpm_now = 94.0f;
+static void engine_tempo(float bpm)
+{
+    if (bpm < (float)BPM_MIN)
+        bpm = (float)BPM_MIN;
+    if (bpm > (float)BPM_MAX)
+        bpm = (float)BPM_MAX;
+    bpm_now = bpm;
+    period_ns = (uint32_t)(2500000000.0f / bpm);     /* 60 s / (bpm * 24) */
+}
+
+/* ------------------------------------------------------- the sync output --- */
+static uint32_t r_prev_ms;
+static int32_t pl_left, pl_right;                    /* samples of each pulse still to go */
+void app_render(int32_t *lr, uint32_t n, uint32_t master_q12)
+{
+    uint32_t i, now = plat_ms(), span = now - r_prev_ms, ns = 0;
+    uint32_t at[8], wid[8], ch[8], k = 0;
+    int32_t level = (int32_t)(7500000.0f * (float)master_q12 / 4096.0f);
+    if (span == 0u || span > 50u)
+        span = (n * 1000u + 22050u) / 44100u;
+    while (pulse_r != pulse_w) {                     /* the pulses the tick made since the last block, in place */
+        pulse_t *p = &pulse_q[pulse_r % NPULSE];
+        int32_t dt = (int32_t)(p->ms - r_prev_ms);
+        uint32_t off = dt > 0 ? (uint32_t)dt * n / span : 0u;
+        if ((int32_t)(p->ms - now) > 0)
+            break;
+        if (k < 8u) {
+            at[k] = off < n ? off : n - 1u;
+            wid[k] = p->width;
+            ch[k] = p->ch;
+            k++;
+        }
+        pulse_r++;
+    }
+    r_prev_ms = now;
+    for (i = 0; i < n; i++) {
+        while (ns < k && at[ns] == i) {
+            if (ch[ns])
+                pl_right = (int32_t)wid[ns];
+            else
+                pl_left = (int32_t)wid[ns];
+            ns++;
+        }
+        lr[2 * i] = set.sync_out && pl_left > 0 ? level : 0;
+        lr[2 * i + 1] = set.sync_out && pl_right > 0 ? level : 0;
+        if (pl_left > 0)
+            pl_left--;
+        if (pl_right > 0)
+            pl_right--;
+    }
+}
+
+void app_panic(void) { pl_left = pl_right = 0; }
+
+/* ------------------------------------------------------------ tap tempo --- */
+/* TapTempo.cpp (Damien Clarke, MIT) as the ClockBox sets it up: 4 taps averaged, a skipped tap detected, the chain
+ * reset after 3 beats or 2 s, beats no shorter than 250 ms (240 BPM) */
+static struct {
+    uint32_t beat_ms, last_tap, dur[4];
+    int idx, taps;
+    uint8_t skipped;
+} tt = {638u, 0u, {0}, 0, 0, 0};
+#define TT_VALUES 4
+
+static float tap_bpm(void) { return 60000.0f / (float)tt.beat_ms; }
+static void tap_set_bpm(float bpm) { tt.beat_ms = (uint32_t)(60000.0f / bpm + 0.5f); }   /* (rounded: see below) */
+static int tap_chain_active(uint32_t ms) { return tt.last_tap + 2000u > ms && tt.last_tap + tt.beat_ms * 3u > ms; }
+static void tap(uint32_t ms)
+{
+    uint32_t d, sum = 0;
+    int i, amount;
+    if (!tap_chain_active(ms)) {
+        tt.taps = 0;
+        tt.idx = 0;
+        for (i = 0; i < TT_VALUES; i++)
+            tt.dur[i] = 0;
+    }
+    d = ms - tt.last_tap;
+    tt.last_tap = ms;
+    if (++tt.taps == 1)
+        return;
+    if (tt.taps > 2 && !tt.skipped && (float)d > (float)tt.beat_ms * 1.75f && (float)d < (float)tt.beat_ms * 2.75f) {
+        d >>= 1;                                     /* a beat missed: half of it */
+        tt.skipped = 1;
+    } else {
+        tt.skipped = 0;
+    }
+    tt.dur[tt.idx] = d;
+    tt.idx = (tt.idx + 1) % TT_VALUES;
+    amount = tt.taps - 1 > TT_VALUES ? TT_VALUES : tt.taps - 1;
+    for (i = 0; i < amount; i++)
+        sum += tt.dur[i];
+    tt.beat_ms = sum / (uint32_t)amount;
+    if (tt.beat_ms < 250u)
+        tt.beat_ms = 250u;
+}
+
+/* -------------------------------------------------------------- tempo --- */
+static int32_t bpm_shown = 94;           /* fBPM_Cache: whole BPM, what the screen shows */
+static float fade_target, fade_diff;     /* fTargetBPM (0: no fade), fBPM_Diff */
+static uint8_t nudge;                    /* -1 / +1 while OCT- / OCT+ held */
+static int32_t nudge_saved;
+
+/* setGlobalBPM. The ClockBox keeps TapTempo's beat in whole ms and re-reads the BPM from it; rounding the beat to the
+ * nearest ms (not down) keeps 245..300 BPM from creeping up a step */
+static void set_bpm(float bpm)
+{
+    if (standalone())
+        tap_set_bpm(bpm);
+    engine_tempo(bpm);
+}
+
+static void set_preset(int p)            /* a press: jump */
+{
+    bpm_shown = set.preset[p];
+    set_bpm((float)bpm_shown);
+    fade_target = 0.0f;
+}
+static void fade_preset(int p)           /* a hold: ease towards it, a 16th of the way at each divider tick */
+{
+    fade_target = (float)set.preset[p];
+    fade_diff = fade_target - bpm_now;
+}
+static void next_beat(void)              /* nextBeat */
+{
+    if (fade_target == 0.0f)
+        return;
+    if (fm_fabsf(bpm_now - fade_target) > 3.0f) {
+        set_bpm(bpm_now + fade_diff / 16.0f);
+    } else {
+        set_bpm(fade_target);
+        bpm_shown = (int32_t)fade_target;
+        fade_target = 0.0f;
+    }
+}
 
 /* --------------------------------------------------------------------- UI --- */
+enum { CFG_NONE, CFG_MODE, CFG_QRS, CFG_DIV, CFG_BRIGHT };
+#define B_SHIFT B_HOME
+#define B_START B_PLAY
+#define B_STOPB B_REC
+#define B_TAP B_SEQ
+static const uint8_t PRESET_BTN[3] = {B_FX, B_SEL, B_ENV};
+static const uint8_t BEAT_KEY[4] = {0, 2, 4, 6};    /* F3 G3 A3 B3 */
+#define EXT_KEY 7u                                  /* C4 */
+
 static struct {
-    char msg[2][24];                     /* a short message over the header */
+    char msg[2][24];
     uint32_t msg_until;
-    uint32_t keys, btn;                  /* held at the last input */
-    uint8_t vel[NKEYS], prs[NKEYS];      /* each key's last velocity, and its pressure while held */
-    int32_t last_key;                    /* the key pressed last: its numbers in the header */
-    uint8_t looking;                     /* Bluetooth MIDI devices: REC pressed, the scan's list up (lib/btdev) */
-    uint32_t rec_t;                      /* REC went down (0: not held, or its hold already acted) */
-    int32_t turns[NE];                   /* detents since boot, per encoder */
-    uint32_t turned_at[NE];              /* when each was last turned: it shows lit for a moment */
+    uint32_t btn;                        /* held at the last input */
+    uint8_t cfg;                         /* iConfigChangeMode */
+    uint8_t used;                        /* buttons whose press took part in a combination: no action on release */
+    uint32_t preset_down[3];             /* when each preset button went down (0: up) */
+    uint8_t preset_long[3];
+    uint32_t red_until;                  /* ledRed() for half a second: saved */
+    uint32_t boot_ms;
+    uint8_t booted;
+    uint32_t last_beat;
+    uint8_t cfg_qrs0, cfg_div0, cfg_bright0;   /* the values a settings page started with */
     uint8_t redraw;
 } ui;
 
@@ -129,7 +542,7 @@ static void text_cat(char *d, const char *s)
     *d = 0;
 }
 
-static void int_text(int32_t v, char *b)     /* signed, no padding */
+static void int_text(int32_t v, char *b)
 {
     char t[12];
     int n = 0;
@@ -156,7 +569,7 @@ void app_say(const char *a, const char *b)
     ui.msg[1][i] = 0;
     ui.msg_until = plat_ms() + 1300u;
     ui.redraw = 1;
-    if (ann_on()) {                          /* and to a screen reader (announce.c, fm1-reader) */
+    if (ann_on()) {
         t[0] = 0;
         text_cat(t, ui.msg[0]);
         if (ui.msg[1][0]) {
@@ -167,333 +580,477 @@ void app_say(const char *a, const char *b)
     }
 }
 
-static void octave_text(char *t)
+static void save(void)                   /* EEPROM.update + ledRed: the settings kept */
 {
-    t[0] = set.octave < 0 ? '-' : '+';
-    t[1] = (char)('0' + (set.octave < 0 ? -set.octave : set.octave));
-    t[2] = 0;
+    if (plat_store_save(OBJ_SETTINGS, &set, sizeof set) == 0) {
+        ui.red_until = plat_ms() + 500u;
+        app_say("SAVED", "");
+    } else {
+        app_say("SAVE", "FAILED");
+    }
 }
 
-/* a screen reader that has just started listening (or asks) hears the whole screen */
+static void switch_mode(void)            /* switchMode + processModeSwitch */
+{
+    char t[24];
+    set.mode = (uint8_t)((set.mode + 1u) % NMODES);
+    if (standalone())
+        set_bpm((float)bpm_shown);
+    fade_target = 0.0f;
+    req_mode = 1;
+    save();
+    t[0] = 0;
+    text_cat(t, MODE_NAME[set.mode]);
+    app_say("MODE", t);
+}
+
+static void cfg_enter(uint8_t c)
+{
+    ui.cfg = c;
+    ui.cfg_qrs0 = set.qrs_offset;
+    ui.cfg_div0 = set.div;
+    ui.cfg_bright0 = set.bright;
+    ui.used |= 1u;
+    ui.redraw = 1;
+}
+
+static void cfg_leave(void)              /* both released: kept if changed */
+{
+    if ((ui.cfg == CFG_QRS && set.qrs_offset != ui.cfg_qrs0) || (ui.cfg == CFG_DIV && set.div != ui.cfg_div0) ||
+        (ui.cfg == CFG_BRIGHT && set.bright != ui.cfg_bright0))
+        save();
+    ui.cfg = CFG_NONE;
+    ui.redraw = 1;
+}
+
+static void press_start(void)            /* startHandler */
+{
+    req_start = 1;
+}
+
+static void press_stop(void)             /* stopHandler */
+{
+    if (standalone())
+        req_stop = 1;
+}
+
+static void press_tap(void)              /* tapHandler: standalone, taps 250 ms apart at least */
+{
+    uint32_t now = plat_ms();
+    if (!standalone())
+        return;
+    if (now - tt.last_tap >= 250u)
+        tap(now);
+}
+
+static void preset_store(int p)          /* HOME + a preset: the tempo now, kept */
+{
+    char t[8];
+    set.preset[p] = (uint16_t)bpm_shown;
+    save();
+    int_text(bpm_shown, t);
+    app_say(p == 0 ? "PRESET 1" : p == 1 ? "PRESET 2" : "PRESET 3", t);
+}
+
+static void nudge_set(int dir)           /* nudgePlus / nudgeMinus */
+{
+    if (!standalone())
+        return;
+    if (dir && !nudge) {
+        nudge_saved = bpm_shown;
+        nudge = (uint8_t)(dir > 0 ? 1 : 2);
+        set_bpm((float)bpm_shown * (dir > 0 ? 1.075f : 0.925f));
+    } else if (!dir && nudge) {
+        nudge = 0;
+        bpm_shown = nudge_saved;
+        set_bpm((float)bpm_shown);
+    }
+    ui.redraw = 1;
+}
+
+static void lights(void)
+{
+    uint32_t now = plat_ms(), keys = 0, btn = 0, glow = 0, i;
+    int red = ui.red_until && now < ui.red_until;
+    static uint32_t dim_set;
+    for (i = 0; i < 4u; i++)
+        if (led[i] != L_OFF || red || update_mode || !ui.booted)
+            keys |= 1u << BEAT_KEY[i];
+    if (ext_led && !standalone())
+        keys |= 1u << EXT_KEY;
+    if (update_mode || red || qrs_wait)
+        btn |= 1u << B_PLAY;                         /* PLAY red */
+    else if (playing)
+        btn |= LED_PLAY_GREEN;
+    for (i = 0; i < 3u; i++)
+        glow |= 1u << PRESET_BTN[i];
+    glow |= 1u << B_SHIFT | 1u << B_TAP | 1u << B_STOPB;
+    if (ui.btn >> B_SHIFT & 1u)
+        btn |= 1u << B_SHIFT;
+    if (set.bright >= BRIGHT_MAX) {
+        if (dim_set) {
+            plat_dim_ns(0);
+            dim_set = 0;
+        }
+        plat_lights(btn, keys, glow, 0, 1);
+    } else {
+        uint32_t ns = 500u + (uint32_t)(set.bright - BRIGHT_MIN) * 3500u / (BRIGHT_MAX - BRIGHT_MIN);
+        if (ns != dim_set) {
+            plat_dim_ns(ns);
+            dim_set = ns;
+        }
+        plat_lights(btn, 0, glow, keys, 1);
+    }
+}
+
+static void input(void)
+{
+    uint32_t btn = plat_buttons(), now = plat_ms(), down = btn & ~ui.btn, up = ui.btn & ~btn, i;
+    int shift = (int)(btn >> B_SHIFT & 1u), start = (int)(btn >> B_START & 1u), stop = (int)(btn >> B_STOPB & 1u),
+        tapb = (int)(btn >> B_TAP & 1u);
+    int32_t e;
+    if (!ui.booted || update_mode) {
+        ui.btn = btn;
+        lights();
+        return;
+    }
+    /* the combinations (the ClockBox's loop(), in its order) */
+    if (shift && start) {
+        if (ui.cfg == CFG_NONE) {
+            cfg_enter(CFG_MODE);
+            switch_mode();
+        }
+    } else if (shift && stop) {
+        if (ui.cfg == CFG_NONE)
+            cfg_enter(CFG_QRS);
+    } else if (shift && tapb) {
+        if (ui.cfg == CFG_NONE)
+            cfg_enter(CFG_DIV);
+    } else if (start && stop && !shift) {
+        if (ui.cfg == CFG_NONE)
+            cfg_enter(CFG_BRIGHT);
+    }
+    if (ui.cfg != CFG_NONE && !shift && !start && !stop)
+        cfg_leave();
+    if (shift && (down & (1u << B_START | 1u << B_STOPB | 1u << B_TAP)))
+        ui.used |= 1u;
+    /* the single buttons: PLAY and STOP on release (Button2's tap), TAP on its press */
+    if ((up >> B_START & 1u) && !ui.used && !shift && ui.cfg == CFG_NONE)
+        press_start();
+    if ((up >> B_STOPB & 1u) && !ui.used && !shift && ui.cfg == CFG_NONE)
+        press_stop();
+    if ((down >> B_TAP & 1u) && !shift && ui.cfg == CFG_NONE)
+        press_tap();
+    /* the presets: a press jumps, a hold of a second fades, HOME + a press stores (standalone) */
+    for (i = 0; i < 3u; i++) {
+        uint32_t bit = 1u << PRESET_BTN[i];
+        if (down & bit) {
+            ui.preset_down[i] = now ? now : 1u;
+            ui.preset_long[i] = 0;
+        }
+        if ((btn & bit) && ui.preset_down[i] && !ui.preset_long[i] && now - ui.preset_down[i] >= 1000u) {
+            ui.preset_long[i] = 1;
+            if (standalone() && !shift) {
+                char t[8];
+                fade_preset((int)i);
+                int_text(set.preset[i], t);
+                app_say("FADE TO", t);
+            }
+        }
+        if ((up & bit) && ui.preset_down[i]) {
+            if (!ui.preset_long[i] && standalone()) {
+                if (shift)
+                    preset_store((int)i);
+                else
+                    set_preset((int)i);
+            }
+            ui.preset_down[i] = 0;
+        }
+    }
+    /* EDIT: the audio sync output on / off (the FM-1's stand-in for the CV jacks) */
+    if (down >> B_EDIT & 1u) {
+        set.sync_out ^= 1u;
+        save();
+        app_say("SYNC OUT", set.sync_out ? "ON" : "OFF");
+    }
+    /* nudge while OCT- / OCT+ held */
+    nudge_set((btn >> B_OCTUP & 1u) ? 1 : (btn >> B_OCTDN & 1u) ? -1 : 0);
+    /* the encoder: the tempo, or the page's value */
+    e = plat_enc(EN_SELECT);
+    if (!e && ui.cfg == CFG_NONE && (e = plat_enc(EN_ALGO)) != 0)
+        e *= 5;                                       /* ALGO: steps of 5, as HOME + SELECT */
+    else if (shift && ui.cfg == CFG_NONE)
+        e *= 5;
+    if (e) {
+        if (ui.cfg == CFG_NONE && standalone() && !nudge) {
+            bpm_shown = clamp(bpm_shown + e, BPM_MIN, BPM_MAX);
+            fade_target = 0.0f;
+            set_bpm((float)bpm_shown);
+        } else if (ui.cfg == CFG_QRS) {
+            set.qrs_offset = (uint8_t)clamp(set.qrs_offset + e, 1, (int32_t)PPQN);
+        } else if (ui.cfg == CFG_DIV) {
+            set.div = (uint8_t)clamp(set.div + e, 0, (int32_t)NDIV - 1);
+        } else if (ui.cfg == CFG_BRIGHT) {
+            set.bright = (uint8_t)clamp(set.bright + e * 10, BRIGHT_MIN, BRIGHT_MAX);
+        }
+        ui.redraw = 1;
+    }
+    /* the tempo from tapping (the ClockBox reads it back every pass) */
+    if (standalone() && !nudge && fm_fabsf(tap_bpm() - (float)bpm_shown) >= 1.0f) {
+        bpm_shown = clamp((int32_t)tap_bpm(), BPM_MIN, BPM_MAX);
+        engine_tempo((float)bpm_shown);
+        ui.redraw = 1;
+    }
+    if (btn != ui.btn)
+        ui.redraw = 1;
+    if (!btn)
+        ui.used = 0;                                  /* (after the releases above: the last one still counts) */
+    ui.btn = btn;
+    lights();
+}
+
+void app_input_only(void) { input(); }
+
+/* ---------------------------------------------------------------- drawing --- */
+#define C_GREEN RGB(40, 220, 90)
+#define C_BLUE RGB(60, 120, 255)
+#define C_PURPLE RGB(210, 60, 230)
+#define C_YELLOW RGB(245, 215, 40)
+#define C_RED RGB(240, 50, 40)
+#define C_CYAN RGB(40, 210, 230)
+#define C_SEGOFF RGB(28, 28, 34)          /* the beat lights and the blinker, off */
+#define C_DIGOFF RGB(12, 12, 15)          /* a seven-segment digit's unlit segments */
+static uint16_t led_rgb(uint8_t l) { return l == L_GREEN ? C_GREEN : l == L_BLUE ? C_BLUE : l == L_PURPLE ? C_PURPLE : 0; }
+
+/* a seven-segment digit, w x h, segments t thick (-1: blank, the unlit segments only) */
+static void seg_digit(int32_t x, int32_t y, int32_t w, int32_t h, int32_t t, int d, uint16_t on)
+{
+    static const uint8_t SEG[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+    uint32_t s = d >= 0 && d <= 9 ? SEG[d] : 0u;
+    int32_t h2 = h / 2;
+    cv_rect(x + t, y, w - 2 * t, t, s & 1u ? on : C_DIGOFF);
+    cv_rect(x + w - t, y + t, t, h2 - t, s & 2u ? on : C_DIGOFF);
+    cv_rect(x + w - t, y + h2, t, h2 - t, s & 4u ? on : C_DIGOFF);
+    cv_rect(x + t, y + h - t, w - 2 * t, t, s & 8u ? on : C_DIGOFF);
+    cv_rect(x, y + h2, t, h2 - t, s & 16u ? on : C_DIGOFF);
+    cv_rect(x, y + t, t, h2 - t, s & 32u ? on : C_DIGOFF);
+    cv_rect(x + t, y + h2 - t / 2, w - 2 * t, t, s & 64u ? on : C_DIGOFF);
+}
+
+static void seg_number(int32_t cx, int32_t y, int32_t v, int digits, int32_t w, int32_t h, int32_t t, uint16_t c)
+{
+    int32_t gap = w / 5, total = digits * w + (digits - 1) * gap, x = cx - total / 2, i, p = 1;
+    for (i = 1; i < digits; i++)
+        p *= 10;
+    for (i = 0; i < digits; i++, p /= 10) {
+        int d = (int)(v / p % 10);
+        if (v < p && p > 1)
+            d = -1;                                  /* no leading zeros */
+        seg_digit(x + i * (w + gap), y, w, h, t, d, c);
+    }
+}
+
+static void centre(int32_t y, const felucca_font_t *f, const char *s, uint16_t c)
+{
+    cv_text((240 - text_w(f, s)) / 2, y, f, s, c);
+}
+
+static void beat_row(int32_t y)          /* the four beat LEDs, and the clock-in LED while following */
+{
+    int32_t i, x0 = standalone() ? 28 : 12;
+    for (i = 0; i < 4; i++) {
+        uint16_t c = led_rgb(led[i]);
+        cv_rect(x0 + i * 48, y, 40, 22, c ? c : C_SEGOFF);
+    }
+    if (!standalone())
+        cv_rect(x0 + 4 * 48 + 4, y, 24, 22, ext_led ? C_YELLOW : C_SEGOFF);
+}
+
+static void draw(void)
+{
+    char t[64], n[12];
+    uint32_t now = plat_ms();
+    int red = ui.red_until && now < ui.red_until;
+    /* the header: the name (or a message), Bluetooth, the blinker */
+    cv_begin(240, 32, C_BLACK);
+    if (now < ui.msg_until) {
+        int32_t x = cv_text(8, 6, &FONT_B, ui.msg[0], red ? C_RED : C_WHITE);
+        cv_text(x + 8, 6, &FONT_B, ui.msg[1], C_HI);
+    } else {
+        int32_t x = cv_text(8, 6, &FONT_B, APP_NAME, C_WHITE);
+        if (FM1B_BLE)
+            cv_text(x + 8, 10, &FONT_XS, "BLE", plat_ble_connected() ? C_HI : C_DIM);
+        if (set.sync_out)
+            cv_text(x + 36, 10, &FONT_XS, "SYNC", C_HI);
+    }
+    {
+        uint16_t c = !blink ? C_SEGOFF : !standalone() && ext_led ? C_YELLOW : qrs_wait ? C_PURPLE :
+                     led[0] == L_GREEN ? C_GREEN : C_BLUE;
+        cv_rect(212, 6, 20, 20, red ? C_RED : c);
+    }
+    cv_blit(0, 0);
+    /* the middle: the tempo, a page's value, or the follow mode's words */
+    cv_begin(240, 144, C_BLACK);
+    if (update_mode) {
+        centre(30, &FONT_L, "UPDATE MODE", C_RED);
+        centre(80, &FONT_S, "MIDI OUT SILENCED", C_GRAY);
+        centre(100, &FONT_S, "POWER OFF AND ON TO LEAVE", C_GRAY);
+    } else if (!ui.booted) {                         /* showInfo: 2 s */
+        centre(14, &FONT_L, "CLOCKBOX", C_YELLOW);
+        t[0] = 0;
+        text_cat(t, "VERSION " VERSION " FM-1");
+        centre(62, &FONT_B, t, C_WHITE);
+        centre(96, &FONT_S, "socialmidi.com", C_GRAY);
+    } else if (ui.cfg == CFG_QRS) {
+        centre(4, &FONT_M, "QRS OFFSET (PPQN)", C_WHITE);
+        seg_number(120, 38, set.qrs_offset, 2, 46, 84, 10, C_HI);
+    } else if (ui.cfg == CFG_DIV) {
+        int digits = DIVIDER[set.div] >= 10 ? 2 : 1, i;
+        centre(4, &FONT_M, "CLOCK DIVIDER", C_WHITE);
+        for (i = 0; i < 10; i++)                     /* the slash */
+            cv_line(digits == 2 ? 30 + i : 60 + i, 122, digits == 2 ? 62 + i : 92 + i, 38, C_HI);
+        seg_number(digits == 2 ? 150 : 140, 38, DIVIDER[set.div], digits, 46, 84, 10, C_HI);
+    } else if (ui.cfg == CFG_BRIGHT) {
+        centre(4, &FONT_M, "LED BRIGHTNESS", C_WHITE);
+        seg_number(120, 38, set.bright, 3, 46, 84, 10, C_HI);
+    } else if (standalone()) {
+        uint16_t c = nudge ? C_AMB : fade_target != 0.0f ? C_CYAN : C_WHITE;
+        seg_number(120, 6, bpm_shown, 3, 56, 100, 11, c);
+        beat_row(118);
+    } else {
+        centre(6, &FONT_M, "FOLLOW CLOCK", C_WHITE);
+        centre(36, &FONT_M, set.mode == M_FOLLOW_DIN ? "FROM TRS MIDI" : "FROM USB MIDI", C_WHITE);
+        if (ext_period_us && now - ext_last_ms < 1000u) {
+            int32_t tenths = (int32_t)(25000000u / ext_period_us);   /* 60e6 / (us * 24) * 10 */
+            t[0] = 0;
+            text_cat(t, "IN ~");
+            int_text(tenths / 10, n);
+            text_cat(t, n);
+            text_cat(t, " BPM");
+            centre(76, &FONT_B, t, C_HI);
+        } else {
+            centre(76, &FONT_B, "WAITING FOR CLOCK", C_DIM);
+        }
+        beat_row(118);
+    }
+    cv_blit(0, 36);
+    /* the bottom: the mode, the presets and the settings; HOME held: what it does */
+    cv_begin(240, 60, C_BLACK);
+    if (ui.booted && !update_mode) {
+        if (ui.cfg == CFG_QRS || ui.cfg == CFG_DIV || ui.cfg == CFG_BRIGHT) {
+            centre(10, &FONT_S, "TURN SELECT TO SET", C_GRAY);
+            centre(32, &FONT_S, "RELEASE TO KEEP", C_GRAY);
+        } else if (ui.btn >> B_SHIFT & 1u) {
+            centre(4, &FONT_XS, "HOME + PLAY: MODE   HOME + REC: QRS", C_HI);
+            centre(20, &FONT_XS, "HOME + SEQ: DIVIDER   HOME + FX/SEL/ENV:", C_HI);
+            centre(36, &FONT_XS, "STORE PRESET   HOME + SELECT: BPM x5", C_HI);
+        } else {
+            int i;
+            int32_t x = 8;
+            centre(2, &FONT_M, MODE_NAME[set.mode], qrs_wait ? C_PURPLE : C_YELLOW);
+            for (i = 0; i < 3; i++) {
+                static const char *const P[3] = {"FX ", "SEL ", "ENV "};
+                int lit = standalone() && set.preset[i] == bpm_shown;
+                x = cv_text(x, 32, &FONT_XS, P[i], C_GRAY);
+                int_text(set.preset[i], n);
+                x = cv_text(x, 32, &FONT_XS, n, lit ? C_WHITE : C_AMB) + 10;
+            }
+            t[0] = 0;
+            text_cat(t, "/");
+            int_text(DIVIDER[set.div], n);
+            text_cat(t, n);
+            text_cat(t, "  OFS ");
+            int_text(set.qrs_offset, n);
+            text_cat(t, n);
+            cv_text(232 - text_w(&FONT_XS, t), 32, &FONT_XS, t, C_GRAY);
+            cv_text(8, 46, &FONT_XS, "SEQ TAP  PLAY START/QRS  REC STOP", C_DIM);
+        }
+    }
+    cv_blit(0, 180);
+}
+
+/* a screen reader that has just started listening (or asks) hears the screen */
 static void speak(void)
 {
-    char t[96], o[4];
+    char t[96], n[12];
     if (ann_on() && ann_where()) {
-        octave_text(o);
         t[0] = 0;
-        text_cat(t, APP_NAME ". OCTAVE ");
-        text_cat(t, o);
-        text_cat(t, ". WAVE ");
-        text_cat(t, WAVE_NAME[set.wave]);
-        if (midi_count) {                    /* the last MIDI message in, as the screen shows it */
-            static const char *const PORT[NPORTS] = {"USB", "BLE", "TRS"};
-            static const char HEX[] = "0123456789ABCDEF";
-            uint32_t m = midi_last, b;
-            char h[10];
-            for (b = 0; b < 3u; b++) {
-                uint32_t v = (m >> (8u + 8u * b)) & 0xFFu;
-                h[3 * b] = HEX[v >> 4];
-                h[3 * b + 1] = HEX[v & 15u];
-                h[3 * b + 2] = b < 2u ? ' ' : 0;
-            }
-            text_cat(t, ". MIDI IN ");
-            text_cat(t, midi_last_port < NPORTS ? PORT[midi_last_port] : "");
-            text_cat(t, " ");
-            text_cat(t, h);
+        text_cat(t, APP_NAME ". ");
+        if (standalone()) {
+            int_text(bpm_shown, n);
+            text_cat(t, n);
+            text_cat(t, " BPM. ");
         }
+        text_cat(t, MODE_NAME[set.mode]);
+        text_cat(t, playing ? ". PLAYING" : ". STOPPED");
         ann_say(t, 0, ANN_NOW);
     }
     ann_tick(plat_ms());
 }
 
-static void note_name(int32_t note, char *b)
+void app_init(void)                     /* (a start clears the RAM on the device; the host's reboot does not) */
 {
-    static const char *const N[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-    char o[12];
-    b[0] = 0;
-    text_cat(b, N[note % 12]);
-    int_text(note / 12 - 1, o);
-    text_cat(b, o);
-}
-
-static void octave_step(int32_t d)
-{
-    int32_t o = clamp(set.octave + d, -2, 2);
-    char t[4];
-    if (o == set.octave)
-        return;
-    voice_note = -1;                         /* a key held across the change would not find its note off */
-    set.octave = (int8_t)o;
-    set_dirty = 1;
-    octave_text(t);
-    app_say("OCTAVE", t);
-}
-
-int template_ble_off(void) { return set.ble_off; }
-
-/* REC held a second: Bluetooth off or on (kept with the settings, so it stays so at the next power-on) */
-static void ble_toggle(void)
-{
-    set.ble_off = (uint8_t)!set.ble_off;
-    set_dirty = 1;
-    plat_ble_enable(!set.ble_off);
-    app_say("BLUETOOTH", set.ble_off ? "OFF" : "ON");
-}
-
-/* REC: a Bluetooth MIDI device (FM1B_BLE_CENTRAL, lib/btdev): look for devices, then connect to the one ALGORITHM
- * picks, then let it go */
-static void ble_device_say(void)
-{
-    char name[21];
-    if (btdev_found(btdev_pick(), name, 0))
-        app_say("DEVICE", name);
-    else
-        app_say("BLE", "SCANNING");
-}
-static void ble_device_button(void)
-{
-    int ev;
-    if (!btdev_busy() && !ui.looking) {
-        ui.looking = 1;
-        app_say("BLE", "SCANNING");
-        return;
-    }
-    ev = btdev_save();
-    ui.looking = 0;
-    app_say(ev == BTDEV_CONNECTING ? btdev_word(ev) : "BLE", ev == BTDEV_CONNECTING ? btdev_name() : btdev_word(ev));
-}
-
-static void input(void)
-{
-    uint32_t keys, btn = plat_buttons(), k;
-    int32_t e;
-    touch_poll();                            /* the sensed keys' presses, velocities and pressure */
-    keys = touch_keys();
-    for (k = 0; k < NKEYS; k++) {            /* key 0 is F3 (MIDI 53) */
-        uint32_t bit = 1u << k, v;
-        int32_t note = 53 + (int32_t)k + 12 * set.octave;
-        if ((keys & bit) && !(ui.keys & bit)) {
-            v = touch_vel(k);
-            ui.vel[k] = (uint8_t)v;
-            ui.prs[k] = 0;
-            ui.last_key = (int32_t)k;
-            note_on(note, v);
-            plat_midi_send(0x09u | 0x90u << 8 | (uint32_t)note << 16 | v << 24, TO_USB | TO_BLE);   /* BLE: if built with it */
-        } else if (!(keys & bit) && (ui.keys & bit)) {
-            ui.prs[k] = 0;
-            note_off(note);
-            plat_midi_send(0x08u | 0x80u << 8 | (uint32_t)note << 16, TO_USB | TO_BLE);
-        } else if ((keys & bit) && touch_pressure(k) != ui.prs[k]) {   /* pressure: poly aftertouch */
-            ui.prs[k] = touch_pressure(k);
-            ui.redraw = 1;
-            plat_midi_send(0x0Au | 0xA0u << 8 | (uint32_t)note << 16 | (uint32_t)ui.prs[k] << 24, TO_USB | TO_BLE);
-        }
-    }
-    for (k = 0; k < NB; k++) {               /* a button pressed: its name, and what it does here */
-        uint32_t bit = 1u << k;
-        if (!(btn & bit) || (ui.btn & bit))
-            continue;
-        if (k == B_OCTDN)
-            octave_step(-1);
-        else if (k == B_OCTUP)
-            octave_step(1);
-        else if (k == B_REC && FM1B_BLE)
-            ui.rec_t = plat_ms();                /* a press: on release (a hold switches Bluetooth) */
-        else if (k == B_SAVE) {
-            if (plat_store_save(OBJ_SETTINGS, &set, sizeof set) == 0) {
-                set_dirty = 0;
-                app_say("SAVED", "");
-            } else {
-                app_say("SAVE", "FAILED");
-            }
-        } else {
-            app_say("BUTTON", BTN_NAME[k]);
-        }
-    }
-    if (FM1B_BLE && ui.rec_t) {             /* REC: held a second, Bluetooth on / off; a press, a device */
-        if (btn >> B_REC & 1u) {
-            if (plat_ms() - ui.rec_t >= 1000u) {
-                ui.rec_t = 0;
-                ble_toggle();
-            }
-        } else {
-            ui.rec_t = 0;
-            if (FM1B_BLE_CENTRAL && !set.ble_off)
-                ble_device_button();
-            else
-                app_say("BUTTON", "REC");
-        }
-    }
-    for (k = 0; k < NE; k++) {               /* an encoder turned: its count; PRESET also changes the wave */
-        char t[12];
-        if ((e = plat_enc((int)k)) == 0)
-            continue;
-        ui.turns[k] += e;
-        ui.turned_at[k] = plat_ms();
-        ui.redraw = 1;
-        if (k == EN_ALGO && FM1B_BLE_CENTRAL && ui.looking) {
-            btdev_choose(btdev_pick() + e);
-            ble_device_say();
-        } else if (k == EN_PRESET) {
-            set.wave ^= 1u;
-            set_dirty = 1;
-            app_say("WAVE", WAVE_NAME[set.wave]);
-        } else {
-            int_text(ui.turns[k], t);
-            app_say(ENC_NAME[k], t);
-        }
-    }
-    if (keys != ui.keys || btn != ui.btn)
-        ui.redraw = 1;
-    ui.keys = keys;
-    ui.btn = btn;
-    plat_glow(1);                            /* the unlit buttons glow, readable in the dark */
-    plat_leds(btn | (set_dirty ? 1u << B_SAVE : 0u), keys);
-}
-
-void app_input_only(void) { input(); }
-
-static void cell(int32_t x, int32_t y, int32_t w, const char *s, int on)   /* a labelled box, lit when on */
-{
-    cv_rect(x, y, w, 18, on ? C_HI : C_LINE);
-    cv_text(x + (w - text_w(&FONT_XS, s)) / 2, y + 2, &FONT_XS, s, on ? C_BLACK : C_GRAY);
-}
-
-static void key_cell(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t k, uint16_t off)
-{
-    int32_t v, p;
-    cv_rect(x, y, w, h, off);
-    if (!(ui.keys >> k & 1u))
-        return;
-    v = (ui.vel[k] * h + 126) / 127;
-    p = (ui.prs[k] * h + 126) / 127;
-    cv_rect(x, y + h - v, w, v, C_HI);
-    if (p)
-        cv_rect(x + 2, y + h - p, w - 4, p, C_WHITE);
-}
-
-static void draw(void)
-{
-    char t[24];
-    int32_t note = voice_note;
-    uint32_t i, now = plat_ms(), pct = plat_master() * 100u / 4096u;
-    static const uint8_t WK[16] = PLAT_WHITE_KEYS, BK[11] = PLAT_BLACK_KEYS;
-    /* the header: the name and the note, or a message for a moment */
-    cv_begin(240, 32, C_BLACK);
-    if (now < ui.msg_until) {
-        int32_t x = cv_text(10, 6, &FONT_B, ui.msg[0], C_WHITE);
-        cv_text(x + 8, 6, &FONT_B, ui.msg[1], C_HI);
-    } else {
-        int32_t x = cv_text(10, 6, &FONT_B, APP_NAME, C_WHITE);
-        if (FM1B_BLE)                        /* Bluetooth: grey while it waits, lit while a computer is connected */
-            x = cv_text(x + 8, 10, &FONT_XS, "BLE", plat_ble_connected() ? C_HI : C_DIM);
-        if (FM1B_BLE_CENTRAL)                /* a Bluetooth MIDI device: lit while connected */
-            cv_text(x + 6, 10, &FONT_XS, "DEV", plat_ble_device() == BLE_DEV_READY ? C_HI : C_DIM);
-        if (note >= 0) {                     /* the note, and the last key's velocity and pressure */
-            int32_t x;
-            note_name(note, t);
-            x = 230 - text_w(&FONT_B, t);
-            cv_text(x, 6, &FONT_B, t, C_HI);
-            if (ui.keys >> ui.last_key & 1u) {
-                char n[24] = "V ";
-                int_text(ui.vel[ui.last_key], t);
-                text_cat(n, t);
-                text_cat(n, "  P ");
-                int_text(ui.prs[ui.last_key], t);
-                text_cat(n, t);
-                cv_text(x - 12 - text_w(&FONT_XS, n), 10, &FONT_XS, n, C_GRAY);
-            }
-        }
-    }
-    cv_blit(0, 0);
-    /* the buttons, 4 to a row, lit while held; the encoders and their counts, lit for a moment after a turn */
-    cv_begin(240, 144, C_BLACK);
-    for (i = 0; i < NB; i++)
-        cell(4 + (int32_t)(i % 4u) * 58, (int32_t)(i / 4u) * 21, 56, BTN_NAME[i], (ui.btn >> i) & 1u);
-    for (i = 0; i < NE; i++) {
-        int32_t x = 4 + (int32_t)(i % 4u) * 58, y = 88 + (int32_t)(i / 4u) * 28;
-        int lit = ui.turned_at[i] && now - ui.turned_at[i] < 300u;
-        cv_text(x, y, &FONT_XS, ENC_NAME[i], lit ? C_HI : C_GRAY);
-        int_text(ui.turns[i], t);
-        cv_text(x, y + 13, &FONT_XS, t, lit ? C_WHITE : C_DIM);
-    }
-    cv_blit(0, 36);
-    /* the keys, black above white: a held key fills to its velocity (amber), its pressure over that (white) */
-    cv_begin(240, 60, C_BLACK);
-    for (i = 0; i < 16u; i++)
-        key_cell(4 + (int32_t)i * 14, 14, 13, 14, WK[i], C_DIM);
-    for (i = 0; i < 11u; i++) {
-        static const uint8_t AT[11] = {0, 1, 2, 4, 5, 7, 8, 9, 11, 12, 14};   /* the white key each one follows */
-        key_cell(4 + (int32_t)AT[i] * 14 + 8, 0, 11, 12, BK[i], C_LINE);
-    }
-    octave_text(t);
-    cv_text(4, 36, &FONT_XS, "OCT", C_GRAY);
-    cv_text(30, 36, &FONT_XS, t, C_HI);
-    cv_text(64, 36, &FONT_XS, "PRESET", C_GRAY);
-    cv_text(112, 36, &FONT_XS, WAVE_NAME[set.wave], C_HI);
-    if (midi_count) {                        /* the last MIDI message in, and where from */
-        static const char *const PORT[NPORTS] = {"USB", "BLE", "TRS"};
-        static const char HEX[] = "0123456789ABCDEF";
-        uint32_t m = midi_last, b;
-        char h[12];
-        for (b = 0; b < 3u; b++) {
-            uint32_t v = (m >> (8u + 8u * b)) & 0xFFu;
-            h[3 * b] = HEX[v >> 4];
-            h[3 * b + 1] = HEX[v & 15u];
-            h[3 * b + 2] = b < 2u ? ' ' : 0;
-        }
-        cv_text(4, 48, &FONT_XS, "MIDI IN", C_GRAY);
-        cv_text(52, 48, &FONT_XS, midi_last_port < NPORTS ? PORT[midi_last_port] : "", C_HI);
-        cv_text(82, 48, &FONT_XS, h, C_WHITE);
-    }
-    cv_text(178, 36, &FONT_XS, "VOL", C_GRAY);
-    int_text((int32_t)pct, t);
-    text_cat(t, "%");
-    cv_text(204, 36, &FONT_XS, t, C_HI);
-    cv_blit(0, 180);
+    memset(&ui, 0, sizeof ui);
+    memset(&tt, 0, sizeof tt);
+    tt.beat_ms = 638u;
+    engine_on = update_mode = 0;
+    req_start = req_stop = req_mode = 0;
+    playing = qrs_wait = 0;
+    ck_tick = beat_count = 0;
+    leds_off();
+    ext_led = blink = 0;
+    ext_ticks = ext_period_us = ext_count = ext_last_ms = 0;
+    starts_out = stops_out = last_start_ms = last_stop_ms = 0;
+    pulse_r = pulse_w = 0;
+    reset_pending = 0;
+    acc_ns = 0;
+    was_standalone = 0;
+    blink_timer = 1;
+    measure = 0;
+    fade_target = fade_diff = 0.0f;
+    nudge = 0;
+    pl_left = pl_right = 0;
+    settings_load();
+    bpm_shown = 94;
+    set_bpm(94.0f);
 }
 
 void app_ui_init(void)
 {
-    touch_on(1);                             /* velocity and pressure: the keys' readings on */
     lcd_fill(0, 0, 240, 240, C_BLACK);
+    ui.boot_ms = plat_ms();
     ui.redraw = 1;
 }
 
 void app_frame(void)
 {
-    static uint32_t last_pct, lit_until, last_ble, last_midi;
-    uint32_t i, now = plat_ms(), pct = plat_master() * 100u / 4096u;
+    static uint32_t last_state;
+    uint32_t now = plat_ms(), state;
+    if (!ui.booted) {
+        if (now - ui.boot_ms < 300u && (plat_buttons() >> B_STOPB & 1u) && !update_mode) {
+            update_mode = 1;                         /* STOP held at power-on */
+            ui.booted = 1;
+            ui.redraw = 1;
+        } else if (now - ui.boot_ms >= 2000u) {
+            ui.booted = 1;
+            ui.btn = plat_buttons();
+            engine_on = 1;                           /* initClock + processModeSwitch */
+            req_mode = 1;
+            ui.redraw = 1;
+        }
+    }
     input();
     speak();
-    for (i = 0; i < NE; i++)                 /* an encoder's light goes out */
-        if (ui.turned_at[i] && now - ui.turned_at[i] < 400u && now > lit_until)
-            lit_until = ui.turned_at[i] + 300u;
-    if (lit_until && now >= lit_until) {
-        lit_until = 0;
-        ui.redraw = 1;
+    if (beat_count != ui.last_beat) {                /* nextBeat: the preset fade's step */
+        ui.last_beat = beat_count;
+        next_beat();
     }
-    if (FM1B_BLE_CENTRAL) {                  /* looking: a device found is named at once (REC connects to it) */
-        static int found;
-        int n = ui.looking ? btdev_count() : 0, ev;
-        btdev_page(ui.looking && !set.ble_off);
-        if (n > found && btdev_pick() < n)
-            ble_device_say();
-        found = n;
-        while ((ev = btdev_event()) != BTDEV_NONE)   /* a device connected, given up or lost */
-            if (ev == BTDEV_CONNECTED || ev == BTDEV_NO_ANSWER || ev == BTDEV_LOST)
-                app_say("DEVICE", btdev_word(ev));
-    }
-    if (midi_count != last_midi) {
-        last_midi = midi_count;
-        ui.redraw = 1;
-    }
-    if (pct != last_pct || (uint32_t)(plat_ble_connected() | plat_ble_device() << 1) != last_ble ||
-        (ui.msg_until && now >= ui.msg_until)) {
-        last_pct = pct;
-        last_ble = (uint32_t)(plat_ble_connected() | plat_ble_device() << 1);
-        if (now >= ui.msg_until)
-            ui.msg_until = 0;
+    state = (uint32_t)blink | (uint32_t)ext_led << 1 | (uint32_t)qrs_wait << 2 | (uint32_t)playing << 3 |
+            (uint32_t)led[0] << 4 | (uint32_t)led[1] << 6 | (uint32_t)led[2] << 8 | (uint32_t)led[3] << 10 |
+            (uint32_t)(ui.red_until && now < ui.red_until) << 12 | (uint32_t)(now < ui.msg_until) << 13 |
+            (uint32_t)bpm_shown << 14 | (uint32_t)(ext_period_us / 2000u) << 24;
+    if (state != last_state) {
+        last_state = state;
         ui.redraw = 1;
     }
     if (ui.redraw) {
@@ -502,36 +1059,62 @@ void app_frame(void)
     }
 }
 
-/* ------------------------------------------------------------ companion --- */
-/* the computer's side (fm1.toml companion = true: docs/COMPANION.md): the saved settings are a file a page can
- * download and send back (app.h APP_FILE_OBJS); the platform checks a file whole before it saves it */
-int app_file_busy(void) { return 0; }   /* (nothing plays on its own here: a file may come at any time) */
-void app_file_changed(uint32_t obj)      /* the computer replaced the settings: use them */
-{
-    if (obj != OBJ_SETTINGS)
-        return;
-    settings_load();
-    set_dirty = 0;
-    ui.redraw = 1;
-}
-
 #ifdef PLAT_HOST
 int app_expect(const char *what, int *got)
 {
-    if (!strcmp(what, "octave"))
-        *got = set.octave;
-    else if (!strcmp(what, "wave"))
-        *got = set.wave;
-    else if (!strcmp(what, "note"))
-        *got = voice_note;
-    else if (!strcmp(what, "dirty"))
-        *got = set_dirty;
-    else if (!strcmp(what, "vel"))           /* the last key's velocity and pressure */
-        *got = ui.vel[ui.last_key];
-    else if (!strcmp(what, "prs"))
-        *got = ui.prs[ui.last_key];
-    else if (!strncmp(what, "turns", 5))    /* turnsN: encoder N's count (plat.h EN_*) */
-        *got = ui.turns[atoi(what + 5) % NE];
+    if (!strcmp(what, "bpm"))
+        *got = bpm_shown;
+    else if (!strcmp(what, "bpm10"))                 /* the engine's tempo, in tenths */
+        *got = (int)(bpm_now * 10.0f + 0.5f);
+    else if (!strcmp(what, "mode"))
+        *got = set.mode;
+    else if (!strcmp(what, "playing"))
+        *got = playing;
+    else if (!strcmp(what, "qrs"))
+        *got = qrs_wait;
+    else if (!strcmp(what, "qrs_offset"))
+        *got = set.qrs_offset;
+    else if (!strcmp(what, "div"))
+        *got = DIVIDER[set.div];
+    else if (!strcmp(what, "bright"))
+        *got = set.bright;
+    else if (!strcmp(what, "sync_out"))
+        *got = set.sync_out;
+    else if (!strncmp(what, "preset", 6))            /* preset1 .. preset3 */
+        *got = set.preset[(atoi(what + 6) + 2) % 3];
+    else if (!strcmp(what, "cfg"))
+        *got = ui.cfg;
+    else if (!strcmp(what, "tick"))
+        *got = (int)ck_tick;
+    else if (!strcmp(what, "tick_in_bar"))
+        *got = (int)(ck_tick % BAR);
+    else if (!strcmp(what, "starts"))
+        *got = (int)starts_out;
+    else if (!strcmp(what, "stops"))
+        *got = (int)stops_out;
+    else if (!strcmp(what, "start_gap"))             /* ms from the last Stop to the last Start */
+        *got = (int)(last_start_ms - last_stop_ms);
+    else if (!strcmp(what, "ext_ticks"))
+        *got = (int)ext_ticks;
+    else if (!strcmp(what, "update_mode"))
+        *got = update_mode;
+    else if (!strncmp(what, "led", 3))               /* led0 .. led3: L_OFF, L_GREEN, L_BLUE, L_PURPLE */
+        *got = led[atoi(what + 3) & 3];
+    else if (!strcmp(what, "mark")) {                /* start measuring the clocks out */
+        m_on = 1;
+        m_count = m_maxdev_us = 0;
+        *got = 1;
+    } else if (!strcmp(what, "rate10"))              /* their tempo, in tenths of BPM */
+        *got = m_count > 1u && m_last != m_first ?
+                   (int)((25000u * (m_count - 1u) + (m_last - m_first) / 2u) / (m_last - m_first)) : 0;
+    else if (!strcmp(what, "jitter_ok"))             /* every spacing within 1 ms of the ideal */
+        *got = m_count > 1u && m_maxdev_us < 1000u;
+    else if (!strcmp(what, "stop_start_ticks"))      /* QRS: the Stop's tick to the Start's */
+        *got = (int)(last_start_tick - last_stop_tick);
+    else if (!strcmp(what, "start_tick_in_bar"))
+        *got = (int)(last_start_tick % BAR);
+    else if (!strcmp(what, "fading"))
+        *got = fade_target != 0.0f;
     else
         return 0;
     return 1;

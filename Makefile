@@ -2,7 +2,7 @@
 PY      := $(CURDIR)/.venv/bin/python
 BASE    := firmware/base
 APP     := firmware/app
-NAME    := myfm1
+NAME    := clockbox
 export DYLD_FALLBACK_LIBRARY_PATH := /opt/homebrew/lib
 
 .PHONY: venv toolchain fw host web install sim sim-serve flash-open inspect identity
@@ -11,7 +11,7 @@ venv:                       ## Python env for the build and host tools
 	python3 -m venv .venv && .venv/bin/pip install -q pillow python-rtmidi mido
 
 toolchain:                  ## (path A) JieLi Linux toolchain + 3 SDK files, hash-pinned
-	cd $(BASE) && tools/setup_toolchain.sh --only jieli,ac79-sdk,python
+	cd $(BASE) && tools/setup_toolchain.sh --only jieli,ac79-sdk
 
 fw:                         ## (path A) firmware/app/build/$(NAME).fwsc  (Docker must be running)
 	cd firmware && $(PY) base/tools/build.py app

@@ -1,159 +1,469 @@
-# The template in the host simulator: tools/build.py template --host, then
-#   app/build/host/myfm1_host app/tests/basic.txt app/build/host
+# CLOCKBOX in the host simulator: tools/build.py app --host, then
+#   app/build/host/clockbox_host app/tests/basic.txt app/build/host
+# Each block checks one ClockBox v3 feature (ClockBoxv3_manual_en.md).
+# --- boot: version screen for 2 s, then the clock runs (sent even while stopped), 94 BPM, QRS STOP START
 wait 600
 shot boot.png
-key 7 down
-wait 50
-expect note 60
-expect midi_out 1
-shot key.png
-key 7 up
-wait 50
-expect note -1
-tap OCT+
-wait 30
-expect octave 1
-expect dirty 1
-turn PRESET 1
-wait 30
-expect wave 1
-turn K3 3
-wait 300
-expect turns5 3
-press FX
-wait 30
-shot controls.png
-release FX
-tap SAVE
-wait 30
-expect dirty 0
-expect store_writes 1
-reboot
-wait 600
-expect octave 1
-expect wave 1
-midi 90 3C 64
-wait 30
-expect note 60
-wav note.wav
-wait 200
-wavstop
-expect peak_db_min -30
-midi 80 3C 00
-listen
-wait 100
-said MYFM1. OCTAVE +1. WAVE TRIANGLE
-tap ARP
-wait 30
-said BUTTON ARP
-# MASTER turned while a note plays: the gain glides, so no sample jumps further than the wave itself does
-midi 90 45 64
-wait 100
-wav master.wav
-master 4096
-wait 20
-master 300
-wait 20
-master 4096
-wait 50
-wavstop
-midi 80 45 00
-# velocity and pressure (lib/touch.c): a key landing at 40 plays at about 40; pressed 80 % more, it has pressure
-key 7 down 40
-wait 60
-expect vel >30
-expect vel <50
-key 7 up
-wait 50
-key 7 down 100 80
-wait 600
-expect prs >40
-shot touch.png
-key 7 up
-wait 50
-# REC held a second: Bluetooth off (and saved: off after a restart too), then on again
-listen
-wait 1200
-press REC
-wait 1100
-release REC
-wait 50
-said BLUETOOTH OFF
-expect ble 0
-tap SAVE
-wait 30
-reboot
-wait 1200
-expect ble 0
-press REC
-wait 1100
-release REC
-wait 1200
-said BLUETOOTH ON
-expect ble 2
-# REC: look for Bluetooth MIDI devices, connect to the one found, let it go (lib/btdev)
-tap REC
-said BLE SCANNING
-wait 700
-said DEVICE BLE MIDI
-tap REC
-said CONNECTING BLE MIDI
-wait 500
-said DEVICE CONNECTED
-expect ble_dev 4
-tap REC
-said BLE DISCONNECTED
-wait 100
-expect ble_dev 0
-unsaid LOST
-# each port's messages counted (plat_midi_count): this is the fifth from USB in this script
-midi USB 90 40 50
-wait 20
-expect midi_in_usb 5
-midi USB 80 40 00
-# Bluetooth's two links, the computer's and the device's: TO_BLE goes to both, each with its own room; their MIDI
-# comes in on PORT_BLE, and plat_midi_in_from says which link (MIDI thru sends it to every other)
+expect playing 0
+wait 1700
 ble connect
-tap REC
-wait 700
-tap REC
-wait 500
-expect ble_dev 4
-expect room_ble 64
-expect room_ble_dev 64
+expect update_mode 0
+expect bpm 94
+expect mode 0
+expect mark 1
+wait 5000
+expect rate10 940
+expect jitter_ok 1
+# --- tempo: SELECT +-1, ALGO +-5, HOME + SELECT +-5
+turn SELECT 6
+wait 30
+expect bpm 100
+turn ALGO 2
+wait 30
+expect bpm 110
+press HOME
+turn SELECT 2
+wait 30
+release HOME
+expect bpm 120
+shot main.png
+# --- PLAY: MIDI Start, then 24 clocks a beat at 120 BPM, within 1 ms
 out
-key 7 down
-wait 50
-key 7 up
-wait 50
-expect_out BLE 80 48 00
-expect_out BLE-DEV 80 48 00
-midi BLE-DEV 90 3C 64
-wait 20
-expect note 60
-expect midi_in_from 8
-midi BLE 80 3C 00
-wait 20
-expect note -1
-expect midi_in_from 2
-midi TRS 90 3C 64
-wait 20
-expect midi_in_from 0
-midi USB 80 3C 00
-wait 20
-expect midi_in_from 1
-# the computer gone: the device's link alone
-ble disconnect
-expect room_ble 0
-expect room_ble_dev 64
+tap PLAY
+wait 30
+expect playing 1
+expect_out USB FA
+expect_out BLE FA
+expect starts 1
+expect led0 1
+expect mark 1
+wait 10000
+expect rate10 1200
+expect jitter_ok 1
+shot playing.png
+# --- QRS while playing (QRS STOP START, offset 1): Stop 1 tick before the one, Start on it
+tap PLAY
+wait 30
+expect qrs 1
+shot qrs.png
+wait 2100
+expect qrs 0
+expect starts 2
+expect stops 1
+expect stop_start_ticks 1
+expect start_tick_in_bar 0
+# --- QRS offset: HOME + REC, SELECT, release: kept
+press HOME
+press REC
+wait 30
+expect cfg 2
+turn SELECT 3
+wait 30
+shot qrs_offset.png
+release REC
+release HOME
+wait 30
+expect cfg 0
+expect qrs_offset 4
+expect store_writes 1
+expect playing 1
+tap PLAY
+wait 2100
+expect stops 2
+expect starts 3
+expect stop_start_ticks 4
+expect start_tick_in_bar 0
+# --- mode: HOME + PLAY -> QRS START: the restart sends Start only
+press HOME
+press PLAY
+wait 30
+release PLAY
+release HOME
+wait 30
+expect mode 1
+expect playing 1
+tap PLAY
+wait 2100
+expect stops 2
+expect starts 4
+expect start_tick_in_bar 0
+# --- clock divider: HOME + SEQ, SELECT
+press HOME
+press SEQ
+wait 30
+expect cfg 3
+turn SELECT 2
+wait 30
+shot divider.png
+release SEQ
+release HOME
+wait 30
+expect div 4
+# --- LED brightness: PLAY + REC, SELECT; neither starts nor stops
+press PLAY
+press REC
+wait 30
+expect cfg 4
+turn SELECT -2
+wait 30
+shot brightness.png
+release PLAY
+release REC
+wait 30
+expect bright 30
+expect playing 1
+expect starts 4
+# --- the sync out on the audio (EDIT): pulses while playing
+tap EDIT
+wait 30
+expect sync_out 1
+master 4096
+peakreset
+wav sync.wav
+wait 1000
+wavstop
+expect peak_db_min -6
+# --- nudge: OCT+ held +7.5 %, back on release
+press OCT+
+wait 30
+expect bpm10 1290
+release OCT+
+wait 30
+expect bpm 120
+# --- STOP: MIDI Stop
 out
-key 7 down
-wait 50
-key 7 up
-wait 50
-expect_out BLE-DEV 80 48 00
-expect_no_out BLE 80 48 00
 tap REC
-wait 100
-expect ble_dev 0
-expect room_ble_dev 0
+wait 30
+expect playing 0
+expect_out USB FC
+expect stops 3
+# --- tap tempo on SEQ: 600 ms apart -> 100 BPM
+press SEQ
+wait 30
+release SEQ
+wait 566
+press SEQ
+wait 30
+release SEQ
+wait 566
+press SEQ
+wait 30
+release SEQ
+wait 566
+press SEQ
+wait 30
+release SEQ
+wait 566
+press SEQ
+wait 30
+release SEQ
+wait 50
+expect bpm 100
+# --- presets: a press jumps; HOME + a press stores; a hold fades
+tap FX
+wait 30
+expect bpm 80
+turn SELECT 53
+wait 30
+expect bpm 133
+press HOME
+tap ENV
+wait 30
+release HOME
+expect preset3 133
+expect bpm 133
+tap FX
+wait 30
+expect bpm 80
+press SEL
+wait 1100
+release SEL
+expect fading 1
+shot fading.png
+wait 14000
+expect fading 0
+expect bpm 100
+# --- kept across a power cycle
+reboot
+wait 2300
+ble connect
+expect mode 1
+expect qrs_offset 4
+expect div 4
+expect bright 30
+expect sync_out 1
+expect preset3 133
+expect bpm 94
+# --- follow DIN: HOME + PLAY (QRS START -> FOLLOW DIN): the TRS jack's clock passed through to USB and BLE
+press HOME
+press PLAY
+wait 30
+release PLAY
+release HOME
+wait 30
+expect mode 2
+out
+midi TRS FA
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+expect playing 1
+expect ext_ticks 48
+expect_out USB FA
+expect_out USB F8
+expect_out BLE F8
+shot follow_din.png
+# QRS while following: Start on the next one counted in
+tap PLAY
+wait 30
+expect qrs 1
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+midi TRS F8
+wait 19
+expect qrs 0
+expect ext_ticks 108
+# --- follow USB: USB's clock goes on to BLE only
+press HOME
+press PLAY
+wait 30
+release PLAY
+release HOME
+wait 30
+expect mode 3
+out
+clock 30 20
+expect ext_ticks 138
+expect_out BLE F8
+expect_no_out USB F8
+shot follow_usb.png
+# --- back to QRS STOP START: the internal clock again
+press HOME
+press PLAY
+wait 30
+release PLAY
+release HOME
+wait 300
+expect mode 0
+expect mark 1
+wait 2000
+expect rate10 940
+# --- update mode: STOP held at power-on, no MIDI out
+press REC
+reboot
+wait 400
+release REC
+expect update_mode 1
+shot update.png
+expect mark 1
+wait 2000
+expect rate10 0

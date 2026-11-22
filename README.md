@@ -8,7 +8,7 @@ The FM-1 is a **JieLi AC791N** (WL82, dual-core PI32v2 at 360 MHz, ~512 KB SRAM,
 
 | Path | What |
 |---|---|
-| `firmware/` | **Your firmware**. `app/` is copied from the fm1-base template and renamed MYFM1; `base/` is [fm1-base](https://github.com/charlesvestal/fm1-base) as a submodule (with felucca-bsp inside) |
+| `firmware/` | **Your firmware**. `app/` is **CLOCKBOX**, a port of [ClockBox v3](https://github.com/Andymann/clockbox-v3) (MIDI master clock; manual: `firmware/app/docs/MANUAL.md`); `base/` is [fm1-base](https://github.com/charlesvestal/fm1-base) as a submodule (with felucca-bsp inside) |
 | `fm1_open/` | M-VAVE's official [FM1 Open V14](https://github.com/m-vave/fm1_open) SDK + app source (submodule) |
 | `tools/fm1tool.py` | macOS host tool: MIDI ports, identity, capability, `.fwsc` inspect, flash (updater protocol), ROM boot |
 | `scripts/build-sim-mac.sh` | Native macOS build of the FM1 Open WASM simulator (the official one is Windows-only) |
@@ -33,7 +33,7 @@ Then edit `firmware/app/app.c` and repeat.
 For hardware:
 ```bash
 make toolchain            # once: JieLi Linux toolchain + 3 AC79 SDK files (hash-pinned), start Docker Desktop first
-make fw                   # firmware/app/build/myfm1.fwsc
+make fw                   # firmware/app/build/clockbox.fwsc
 ```
 Then read [docs/RECOVERY.md](docs/RECOVERY.md) and take the full flash backup.
 ```bash
@@ -43,6 +43,6 @@ make install              # flash over USB-MIDI
 To work on M-VAVE's own instrument instead (path B), run `make sim-serve` and open http://127.0.0.1:8173. For the firmware, see [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md#b-fm1-open-sdk).
 
 ## Before you publish
-- Set your own `id_prefix` in `firmware/app/fm1.toml` (`FM-1_77` is a placeholder) and fill in author/repo/licence.
+- `id_prefix` in `firmware/app/fm1.toml` is `FM-1_130977` (dev builds `FM-1_13097700`); fill in author/repo/licence.
 - Before release, replace fm1-base/felucca-bsp's USB test IDs (pid.codes 1209:0001/0002).
 - Ship `LICENSES/Apache-2.0.txt` with every package: the boot files come from the JieLi SDK.

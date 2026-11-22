@@ -17,13 +17,15 @@ Pick **A** for "my own firmware". Pick **B** to build on M-VAVE's instrument (DX
 One-time setup (downloads ~26 MB toolchain + 3 SDK files, all hash-pinned in `base/tools/toolchain.lock`):
 
 ```bash
-cd firmware/base && tools/setup_toolchain.sh --only jieli,ac79-sdk,python
+cd firmware/base && tools/setup_toolchain.sh --only jieli,ac79-sdk   # the 'python' step needs uv; the workspace .venv replaces it
 ```
 
 Docker Desktop must be running: on macOS, `build.py` runs the JieLi tools in a pinned distroless linux/amd64 container.
 
+The app uses `ble_stack = "own"` (fm1-base's MPL Bluetooth stack). The template's default JieLi BLE stack needs the full AC79 SDK (headers + `btctrler.a`/`btstack.a`), which this setup doesn't fetch.
+
 ```bash
-make fw          # firmware/app/build/myfm1.fwsc
+make fw          # firmware/app/build/clockbox.fwsc
 make host        # host simulator + firmware/app/tests/basic.txt
 make web         # browser emulator (needs emscripten: brew install emscripten)
 make install     # flash over USB-MIDI (fm1_install.py)
